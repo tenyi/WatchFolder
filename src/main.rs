@@ -498,3 +498,138 @@ fn queue_email(email_tx: &Sender<EmailJob>, to: &str, body: String) -> Result<()
         .context("郵件佇列已關閉")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{DataChange, ModifyKind, RemoveKind};
+    use notify::{Event, EventKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::Instant;
+    use tempfile::tempdir;
+
+    fn key(path: &Path) -> String {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn debounced_event(kind: EventKind, paths: &[&Path]) -> DebouncedEvent {
+        let event = paths.iter().fold(Event::new(kind), |event, path| {
+            event.add_path((*path).to_path_buf())
+        });
+        DebouncedEvent::new(event, Instant::now())
+    }
+
+    fn queued_jobs(rx: &Receiver<EmailJob>) -> Vec<EmailJob> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn parse_hash_line_supports_tab_and_legacy_formats() {
+        assert_eq!(
+            parse_hash_line("/tmp/a:b.txt\t012345"),
+            Some(("/tmp/a:b.txt".to_string(), "012345".to_string()))
+        );
+        assert_eq!(
+            parse_hash_line("/tmp/a:b.txt:012345"),
+            Some(("/tmp/a".to_string(), "b.txt:012345".to_string()))
+        );
+        assert_eq!(parse_hash_line("invalid"), None);
+        assert_eq!(parse_hash_line("\t012345"), None);
+    }
+
+    #[test]
+    fn scan_directory_and_hashes_round_trip() {
+        let temp = tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = nested.join("data.txt");
+        fs::write(&file, "initial").unwrap();
+        let hashes_path = temp.path().join(HASHES_FILENAME);
+
+        let hashes = scan_directory(temp.path(), &hashes_path).unwrap();
+
+        assert_eq!(
+            hashes.get(&key(&file)),
+            Some(&calculate_hash(&file).unwrap())
+        );
+        assert!(!hashes.contains_key(&key(&hashes_path)));
+
+        write_hashes(&hashes, &hashes_path).unwrap();
+        assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
+    }
+
+    #[test]
+    fn process_file_lifecycle_updates_hashes_and_queues_notifications() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("watched.txt");
+        let hashes_path = temp.path().join(HASHES_FILENAME);
+        let (tx, rx) = mpsc::channel();
+        let mut hashes = HashMap::new();
+
+        fs::write(&file, "one").unwrap();
+        process_debounced_event(
+            &debounced_event(EventKind::Create(notify::event::CreateKind::File), &[&file]),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            hashes.get(&key(&file)),
+            Some(&calculate_hash(&file).unwrap())
+        );
+        assert_eq!(queued_jobs(&rx).len(), 1);
+        assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
+
+        fs::write(&file, "two").unwrap();
+        process_debounced_event(
+            &debounced_event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &[&file],
+            ),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(queued_jobs(&rx).len(), 1);
+
+        let unchanged = hashes.clone();
+        process_debounced_event(
+            &debounced_event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &[&file],
+            ),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(hashes, unchanged);
+        assert!(queued_jobs(&rx).is_empty());
+
+        fs::remove_file(&file).unwrap();
+        process_debounced_event(
+            &debounced_event(EventKind::Remove(RemoveKind::File), &[&file]),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+        assert!(!hashes.contains_key(&key(&file)));
+        assert_eq!(queued_jobs(&rx).len(), 1);
+        assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
+    }
+}
