@@ -659,6 +659,10 @@ mod tests {
 
         assert!(!hashes.contains_key(&key(&old_path)));
         assert!(hashes.contains_key(&key(&new_path)));
+        assert!(hashes_path.exists());
+        let persisted = fs::read_to_string(&hashes_path).unwrap();
+        assert!(persisted.contains(&key(&new_path)));
+        assert!(!persisted.contains(&key(&old_path)));
         assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
         assert_eq!(queued_jobs(&rx).len(), 2);
     }
@@ -670,6 +674,7 @@ mod tests {
         fs::create_dir(&nested_dir).unwrap();
         let nested_hashes = nested_dir.join(HASHES_FILENAME);
         let root_hashes = temp.path().join(HASHES_FILENAME);
+        fs::write(&root_hashes, "root state").unwrap();
         fs::write(&nested_hashes, "initial").unwrap();
 
         let mut hashes = scan_directory(temp.path(), &root_hashes).unwrap();
@@ -733,6 +738,9 @@ mod tests {
         );
 
         assert!(result.is_ok());
+        assert!(hashes_path.exists());
+        let persisted = fs::read_to_string(&hashes_path).unwrap();
+        assert!(persisted.contains(&key(&file)));
         assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
         assert_eq!(
             hashes.get(&key(&file)),
