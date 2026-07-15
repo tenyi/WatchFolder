@@ -632,4 +632,111 @@ mod tests {
         assert_eq!(queued_jobs(&rx).len(), 1);
         assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
     }
+
+    #[test]
+    fn rename_event_removes_old_hash_and_persists_new_path() {
+        let temp = tempdir().unwrap();
+        let old_path = temp.path().join("old.txt");
+        let new_path = temp.path().join("new.txt");
+        let hashes_path = temp.path().join(HASHES_FILENAME);
+        fs::write(&old_path, "same contents").unwrap();
+        let mut hashes = scan_directory(temp.path(), &hashes_path).unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        fs::rename(&old_path, &new_path).unwrap();
+        process_debounced_event(
+            &debounced_event(
+                EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+                &[&old_path, &new_path],
+            ),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+
+        assert!(!hashes.contains_key(&key(&old_path)));
+        assert!(hashes.contains_key(&key(&new_path)));
+        assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
+        assert_eq!(queued_jobs(&rx).len(), 2);
+    }
+
+    #[test]
+    fn nested_hashes_file_is_monitored_but_root_hashes_file_is_ignored() {
+        let temp = tempdir().unwrap();
+        let nested_dir = temp.path().join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested_hashes = nested_dir.join(HASHES_FILENAME);
+        let root_hashes = temp.path().join(HASHES_FILENAME);
+        fs::write(&nested_hashes, "initial").unwrap();
+
+        let mut hashes = scan_directory(temp.path(), &root_hashes).unwrap();
+        assert!(hashes.contains_key(&key(&nested_hashes)));
+        assert!(!hashes.contains_key(&key(&root_hashes)));
+
+        fs::write(&nested_hashes, "changed").unwrap();
+        let (tx, rx) = mpsc::channel();
+        process_debounced_event(
+            &debounced_event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &[&nested_hashes],
+            ),
+            temp.path(),
+            &root_hashes,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hashes.get(&key(&nested_hashes)),
+            Some(&calculate_hash(&nested_hashes).unwrap())
+        );
+        assert_eq!(queued_jobs(&rx).len(), 1);
+    }
+
+    #[test]
+    fn remove_does_not_guess_hash_by_basename() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first/file.txt");
+        let second = temp.path().join("second/file.txt");
+        let mut hashes = HashMap::new();
+        hashes.insert(first.to_string_lossy().into_owned(), "first".to_string());
+        hashes.insert(second.to_string_lossy().into_owned(), "second".to_string());
+
+        assert_eq!(find_hash_key(&hashes, Path::new("file.txt")), None);
+    }
+
+    #[test]
+    fn closed_email_queue_does_not_block_hash_persistence() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("watched.txt");
+        let hashes_path = temp.path().join(HASHES_FILENAME);
+        fs::write(&file, "new content").unwrap();
+        let mut hashes = HashMap::new();
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+
+        let result = process_debounced_event(
+            &debounced_event(
+                EventKind::Create(notify::event::CreateKind::File),
+                &[&file],
+            ),
+            temp.path(),
+            &hashes_path,
+            &mut hashes,
+            "to@example.com",
+            &tx,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(load_hashes(temp.path(), &hashes_path).unwrap(), hashes);
+        assert_eq!(
+            hashes.get(&key(&file)),
+            Some(&calculate_hash(&file).unwrap())
+        );
+    }
 }
