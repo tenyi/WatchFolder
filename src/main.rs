@@ -50,6 +50,9 @@ fn run() -> Result<()> {
     if !watch_dir.is_dir() {
         bail!("監控目錄不存在或不是資料夾: {}", watch_dir.display());
     }
+    let watch_dir = watch_dir
+        .canonicalize()
+        .with_context(|| format!("無法解析監控目錄: {}", watch_dir.display()))?;
 
     let smtp = SmtpConfig::from_env()?;
     let debounce_ms = env::var("DEBOUNCE_MS")
@@ -67,15 +70,11 @@ fn run() -> Result<()> {
     let email_tx = spawn_email_worker(smtp);
 
     let (debounce_tx, debounce_rx) = mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(debounce_ms),
-        None,
-        move |result| {
-            if debounce_tx.send(result).is_err() {
-                eprintln!("debouncer channel 已關閉");
-            }
-        },
-    )
+    let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), None, move |result| {
+        if debounce_tx.send(result).is_err() {
+            eprintln!("debouncer channel 已關閉");
+        }
+    })
     .context("無法建立檔案監聽 debouncer")?;
 
     debouncer
@@ -150,6 +149,11 @@ struct EmailJob {
     body: String,
 }
 
+struct EventOutcome {
+    hashes: HashMap<String, String>,
+    emails: Vec<EmailJob>,
+}
+
 /// 建立單一背景執行緒處理所有寄信任務
 fn spawn_email_worker(smtp: SmtpConfig) -> Sender<EmailJob> {
     let (tx, rx) = mpsc::channel::<EmailJob>();
@@ -184,21 +188,14 @@ fn build_mailer(smtp: &SmtpConfig) -> Result<SmtpTransport> {
         .build())
 }
 
-fn send_email(
-    mailer: &SmtpTransport,
-    from: &str,
-    to: &str,
-    body: &str,
-) -> Result<()> {
+fn send_email(mailer: &SmtpTransport, from: &str, to: &str, body: &str) -> Result<()> {
     let email = Message::builder()
         .from(from.parse::<Mailbox>().context("SMTP_FROM 格式無效")?)
         .to(to.parse::<Mailbox>().context("通知電子郵件格式無效")?)
         .subject("檔案變動通知")
         .body(body.to_string())?;
 
-    mailer
-        .send(&email)
-        .context("SMTP 寄信失敗")?;
+    mailer.send(&email).context("SMTP 寄信失敗")?;
     Ok(())
 }
 
@@ -210,115 +207,87 @@ fn process_debounced_event(
     notify_email: &str,
     email_tx: &Sender<EmailJob>,
 ) -> Result<()> {
-    // 若系統回報可能漏事件，重新掃描整個目錄並比對差異
-    if event.need_rescan() {
-        eprintln!("收到 rescan 旗標，重新掃描目錄...");
-        rescan_and_notify(watch_dir, hashes_path, file_hashes, notify_email, email_tx)?;
+    use notify::{event::ModifyKind, EventKind};
+
+    let outcome =
+        if event.need_rescan() || matches!(&event.kind, EventKind::Modify(ModifyKind::Name(_))) {
+            eprintln!("收到 rescan 旗標，重新掃描目錄...");
+            plan_rescan(watch_dir, hashes_path, file_hashes, notify_email)?
+        } else {
+            // 若事件僅涉及根目錄的 hashes.txt 本身，略過避免無限迴圈
+            if event.paths.iter().all(|p| is_hashes_file(p, hashes_path)) {
+                return Ok(());
+            }
+            plan_event(event, hashes_path, file_hashes, notify_email)?
+        };
+
+    if outcome.hashes == *file_hashes {
         return Ok(());
     }
 
-    // 若事件僅涉及 hashes.txt 本身，略過避免無限迴圈
-    if event
-        .paths
-        .iter()
-        .all(|p| is_hashes_file(p, hashes_path))
-    {
-        return Ok(());
-    }
-
-    use notify::EventKind;
-
-    match &event.kind {
-        EventKind::Create(_) | EventKind::Modify(_) => {
-            let mut changed = false;
-            for path in &event.paths {
-                if path.is_file() && !is_hashes_file(path, hashes_path) {
-                    if handle_file_change(file_hashes, path, notify_email, email_tx)? {
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                write_hashes(file_hashes, hashes_path)?;
-            }
+    // 寫入成功後才更新記憶體基準；寄信失敗不回滾，避免重複通知同一變更。
+    write_hashes(&outcome.hashes, hashes_path)?;
+    *file_hashes = outcome.hashes;
+    for email in outcome.emails {
+        if let Err(e) = queue_email(email_tx, email) {
+            eprintln!("無法排入通知郵件，雜湊狀態已更新: {e:#}");
         }
-        EventKind::Remove(_) => {
-            let mut changed = false;
-            for path in &event.paths {
-                if is_hashes_file(path, hashes_path) {
-                    continue;
-                }
-                if handle_file_remove(file_hashes, path, notify_email, email_tx)? {
-                    changed = true;
-                }
-            }
-            if changed {
-                write_hashes(file_hashes, hashes_path)?;
-            }
-        }
-        _ => {}
     }
 
     Ok(())
 }
 
-/// 重新掃描目錄，比對雜湊差異並發送通知
-fn rescan_and_notify(
+fn plan_rescan(
     watch_dir: &Path,
     hashes_path: &Path,
-    file_hashes: &mut HashMap<String, String>,
+    file_hashes: &HashMap<String, String>,
     notify_email: &str,
-    email_tx: &Sender<EmailJob>,
-) -> Result<()> {
-    // 先以新掃描結果取代，確保即使後續通知失敗，雜湊表仍為最新基準（不會變空）
-    let old_hashes = std::mem::replace(file_hashes, scan_directory(watch_dir, hashes_path)?);
+) -> Result<EventOutcome> {
+    let hashes = scan_directory(watch_dir, hashes_path)?;
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let mut emails = Vec::new();
 
-    // 新增或修改的檔案
-    for (path, new_hash) in file_hashes.iter() {
-        match old_hashes.get(path) {
+    for (path, new_hash) in &hashes {
+        match file_hashes.get(path) {
             Some(old_hash) if old_hash == new_hash => {}
             Some(old_hash) => {
-                let body = format!(
+                emails.push(EmailJob {
+                    to: notify_email.to_string(),
+                    body: format!(
                     "檔案變動時間: {timestamp}\n路徑: {path}\n原始雜湊值: {old_hash}\n新的雜湊值: {new_hash}"
-                );
-                queue_email(email_tx, notify_email, body)?;
+                    ),
+                });
             }
             None => {
-                let body = format!(
-                    "檔案變動時間: {timestamp}\n路徑: {path}\n新的雜湊值: {new_hash}"
-                );
-                queue_email(email_tx, notify_email, body)?;
+                emails.push(EmailJob {
+                    to: notify_email.to_string(),
+                    body: format!(
+                        "檔案變動時間: {timestamp}\n路徑: {path}\n新的雜湊值: {new_hash}"
+                    ),
+                });
             }
         }
     }
 
-    // 已刪除的檔案
-    for (path, old_hash) in &old_hashes {
-        if !file_hashes.contains_key(path) {
-            let body = format!(
-                "檔案刪除時間: {timestamp}\n路徑: {path}\n刪除前雜湊值: {old_hash}"
-            );
-            queue_email(email_tx, notify_email, body)?;
+    for (path, old_hash) in file_hashes {
+        if !hashes.contains_key(path) {
+            emails.push(EmailJob {
+                to: notify_email.to_string(),
+                body: format!("檔案刪除時間: {timestamp}\n路徑: {path}\n刪除前雜湊值: {old_hash}"),
+            });
         }
     }
 
-    write_hashes(file_hashes, hashes_path)?;
-    Ok(())
+    Ok(EventOutcome { hashes, emails })
 }
 
 fn is_hashes_file(path: &Path, hashes_path: &Path) -> bool {
     path == hashes_path
-        || path
-            .file_name()
-            .is_some_and(|name| name == Path::new(HASHES_FILENAME))
 }
 
 /// 將路徑轉為一致的 key（優先使用 canonical 絕對路徑）
 fn path_key(path: &Path) -> Result<String> {
-    let resolved = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     Ok(resolved.to_string_lossy().into_owned())
 }
 
@@ -371,8 +340,7 @@ fn scan_directory_inner(
     hashes_path: &Path,
     hashes: &mut HashMap<String, String>,
 ) -> Result<()> {
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("無法讀取目錄: {}", dir.display()))?
+    for entry in fs::read_dir(dir).with_context(|| format!("無法讀取目錄: {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -393,76 +361,88 @@ fn scan_directory_inner(
 }
 
 fn write_hashes(hashes: &HashMap<String, String>, hashes_path: &Path) -> Result<()> {
-    let file = File::create(hashes_path)
-        .with_context(|| format!("無法寫入 {}", hashes_path.display()))?;
+    let file =
+        File::create(hashes_path).with_context(|| format!("無法寫入 {}", hashes_path.display()))?;
     let mut writer = BufWriter::new(file);
 
     for (path, hash) in hashes {
         // tab 分隔避免路徑中的冒號造成解析錯誤
-        writeln!(writer, "{path}\t{hash}")
-            .context("寫入 hashes.txt 失敗")?;
+        writeln!(writer, "{path}\t{hash}").context("寫入 hashes.txt 失敗")?;
     }
     Ok(())
 }
 
 fn calculate_hash(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("無法開啟檔案: {}", path.display()))?;
+    let mut file = File::open(path).with_context(|| format!("無法開啟檔案: {}", path.display()))?;
     let mut sha256 = Sha256::new();
     std::io::copy(&mut file, &mut sha256)
         .with_context(|| format!("無法讀取檔案: {}", path.display()))?;
     Ok(hex::encode(sha256.finalize()))
 }
 
-/// 處理新增或修改；回傳 true 表示雜湊表有變動
-fn handle_file_change(
-    hashes: &mut HashMap<String, String>,
-    path: &Path,
+fn plan_event(
+    event: &DebouncedEvent,
+    hashes_path: &Path,
+    file_hashes: &HashMap<String, String>,
     notify_email: &str,
-    email_tx: &Sender<EmailJob>,
-) -> Result<bool> {
-    let path_str = path_key(path)?;
-    let new_hash = calculate_hash(path)?;
+) -> Result<EventOutcome> {
+    use notify::EventKind;
 
-    if hashes.get(&path_str).is_some_and(|old| old == &new_hash) {
-        return Ok(false);
+    let mut hashes = file_hashes.clone();
+    let mut emails = Vec::new();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    match &event.kind {
+        EventKind::Create(_) | EventKind::Modify(_) => {
+            for path in &event.paths {
+                if !path.is_file() || is_hashes_file(path, hashes_path) {
+                    continue;
+                }
+
+                let key = path_key(path)?;
+                let new_hash = calculate_hash(path)?;
+                if hashes.get(&key).is_some_and(|old| old == &new_hash) {
+                    continue;
+                }
+
+                let body = match hashes.get(&key) {
+                    Some(old_hash) => format!(
+                        "檔案變動時間: {timestamp}\n路徑: {key}\n原始雜湊值: {old_hash}\n新的雜湊值: {new_hash}"
+                    ),
+                    None => format!(
+                        "檔案變動時間: {timestamp}\n路徑: {key}\n新的雜湊值: {new_hash}"
+                    ),
+                };
+                hashes.insert(key, new_hash);
+                emails.push(EmailJob {
+                    to: notify_email.to_string(),
+                    body,
+                });
+            }
+        }
+        EventKind::Remove(_) => {
+            for path in &event.paths {
+                if is_hashes_file(path, hashes_path) {
+                    continue;
+                }
+                let Some(key) = find_hash_key(&hashes, path) else {
+                    continue;
+                };
+                let Some(old_hash) = hashes.remove(&key) else {
+                    continue;
+                };
+                emails.push(EmailJob {
+                    to: notify_email.to_string(),
+                    body: format!(
+                        "檔案刪除時間: {timestamp}\n路徑: {key}\n刪除前雜湊值: {old_hash}"
+                    ),
+                });
+            }
+        }
+        _ => {}
     }
 
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let body = match hashes.get(&path_str) {
-        Some(old_hash) => format!(
-            "檔案變動時間: {timestamp}\n路徑: {path_str}\n原始雜湊值: {old_hash}\n新的雜湊值: {new_hash}"
-        ),
-        None => format!(
-            "檔案變動時間: {timestamp}\n路徑: {path_str}\n新的雜湊值: {new_hash}"
-        ),
-    };
-
-    hashes.insert(path_str, new_hash);
-    queue_email(email_tx, notify_email, body)?;
-    Ok(true)
-}
-
-/// 處理刪除；回傳 true 表示雜湊表有變動
-fn handle_file_remove(
-    hashes: &mut HashMap<String, String>,
-    path: &Path,
-    notify_email: &str,
-    email_tx: &Sender<EmailJob>,
-) -> Result<bool> {
-    let Some(key) = find_hash_key(hashes, path) else {
-        return Ok(false);
-    };
-    let Some(old_hash) = hashes.remove(&key) else {
-        return Ok(false);
-    };
-
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let body = format!(
-        "檔案刪除時間: {timestamp}\n路徑: {key}\n刪除前雜湊值: {old_hash}"
-    );
-    queue_email(email_tx, notify_email, body)?;
-    Ok(true)
+    Ok(EventOutcome { hashes, emails })
 }
 
 /// 在雜湊表中尋找與事件路徑對應的 key（刪除時路徑可能無法 canonicalize）
@@ -476,26 +456,22 @@ fn find_hash_key(hashes: &HashMap<String, String>, path: &Path) -> Option<String
             return Some(canonical);
         }
     }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(parent) = parent.canonicalize() {
+            let resolved = parent.join(name).to_string_lossy().into_owned();
+            if hashes.contains_key(&resolved) {
+                return Some(resolved);
+            }
+        }
+    }
     hashes
         .keys()
         .find(|k| Path::new(k.as_str()) == path)
         .cloned()
-        .or_else(|| {
-            let name = path.file_name()?;
-            hashes
-                .keys()
-                .find(|k| Path::new(k.as_str()).file_name() == Some(name))
-                .cloned()
-        })
 }
 
-fn queue_email(email_tx: &Sender<EmailJob>, to: &str, body: String) -> Result<()> {
-    email_tx
-        .send(EmailJob {
-            to: to.to_string(),
-            body,
-        })
-        .context("郵件佇列已關閉")?;
+fn queue_email(email_tx: &Sender<EmailJob>, email: EmailJob) -> Result<()> {
+    email_tx.send(email).context("郵件佇列已關閉")?;
     Ok(())
 }
 
@@ -726,10 +702,7 @@ mod tests {
         drop(rx);
 
         let result = process_debounced_event(
-            &debounced_event(
-                EventKind::Create(notify::event::CreateKind::File),
-                &[&file],
-            ),
+            &debounced_event(EventKind::Create(notify::event::CreateKind::File), &[&file]),
             temp.path(),
             &hashes_path,
             &mut hashes,
